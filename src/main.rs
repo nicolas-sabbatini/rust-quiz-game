@@ -1,8 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
+use crossbeam::channel::{bounded, Sender};
 use csv::ReaderBuilder;
 use rand::{seq::SliceRandom, thread_rng};
-use std::{fs::File, io::stdin};
+use std::{fs::File, io::stdin, sync::Arc, thread, time::Duration};
 
 struct Question {
     question: String,
@@ -22,10 +23,12 @@ impl Question {
 struct Quiz {
     questions: Vec<Question>,
     correct: usize,
+    finished: bool,
+    time: u64,
 }
 
 impl Quiz {
-    fn ask(&mut self) {
+    fn ask(&mut self, sender: &Sender<()>) {
         for (num, question) in self.questions.iter().enumerate() {
             println!("\nQuestion #{}:", num + 1);
             question.ask();
@@ -37,9 +40,15 @@ impl Quiz {
                 println!("❌ Incorrect ❌");
             }
         }
+        self.finished = true;
+        sender.send(()).expect("Unable to send message");
     }
 
     fn result(&self) {
+        if !self.finished {
+            println!("⏲️⏲️ Time is up! ⏲️⏲️");
+            println!("Lets see how you did...");
+        }
         println!("You got {} out of {}", self.correct, self.questions.len());
         if self.correct == self.questions.len() {
             println!("🎉🎉🎉 Congratulations you are a GENIUS 🎉🎉🎉");
@@ -57,11 +66,15 @@ impl Quiz {
             .has_headers(false) // We don't have headers
             .flexible(true) // We want to allow different number of columns
             .from_reader(file);
+        let mut time = 30;
         for row in cvs_reader.records() {
             let row = row.expect("Unable to read row");
-            let mut row_iter = row.iter();
-            let question = row_iter.next().expect("Unable to read question");
-            let answer = row_iter.next().expect("Unable to read answer");
+            if row.len() == 1 {
+                time = row[0].parse().expect("Unable to parse time");
+                continue;
+            }
+            let question = &row[0];
+            let answer = &row[1];
             questions.push(Question {
                 question: question.to_string(),
                 answer: answer.to_string(),
@@ -71,6 +84,8 @@ impl Quiz {
         Ok(Quiz {
             questions,
             correct: 0,
+            finished: false,
+            time,
         })
     }
 }
@@ -98,8 +113,28 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mut quiz = Quiz::from_cvs(&args.cvs_path)?;
-    quiz.ask();
-    quiz.result();
+
+    let quiz = Quiz::from_cvs(&args.cvs_path)?;
+    let time = quiz.time;
+
+    let quiz_arc = Arc::new(quiz);
+    let quiz_arc_thread = quiz_arc.clone();
+
+    let (tx, rx) = bounded(1);
+    let tx2 = tx.clone();
+
+    thread::spawn(move || unsafe {
+        // Unsafe magic to get a mutable reference to the arc
+        let quiz = &mut *std::ptr::addr_of!((*quiz_arc_thread)).cast_mut();
+        quiz.ask(&tx);
+    });
+
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(time));
+        tx2.send(()).expect("Unable to send message");
+    });
+
+    rx.recv().expect("Unable to receive message");
+    quiz_arc.result();
     Ok(())
 }
